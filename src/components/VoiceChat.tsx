@@ -11,21 +11,33 @@ type Message = {
 };
 
 const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
-  const [isListening, setIsListening] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const recognitionRef = useRef<any>(null);
   const [conversationHistory, setConversationHistory] = useState<Message[]>([]);
-  const timeoutRef = useRef<number | null>(null);
-
-  // Get the recognition language from environment variables, default to en-US
-  const recognitionLang = import.meta.env.VITE_SPEECH_RECOGNITION_LANG || 'en-US';
+  const [lastRecording, setLastRecording] = useState<Blob | null>(null);
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
 
   const openai = new OpenAI({
     apiKey: apiKey,
     dangerouslyAllowBrowser: true,
   });
+
+  const downloadRecording = useCallback(() => {
+    if (lastRecording) {
+      const url = URL.createObjectURL(lastRecording);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'recording.webm';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  }, [lastRecording]);
 
   const speak = useCallback(async (text: string) => {
     try {
@@ -58,51 +70,75 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
     }
   }, []);
 
-  const stopListening = useCallback(() => {
-    if (recognitionRef.current) {
-      console.log('Stopping recognition...');
-      recognitionRef.current.stop();
-      setIsListening(false);
-      if (timeoutRef.current) {
-        window.clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
+  const stopRecording = useCallback(async () => {
+    if (mediaRecorderRef.current && isRecording) {
+      console.log('Stopping recording...');
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
     }
-  }, []);
+  }, [isRecording]);
 
-  const startListening = useCallback(() => {
+  const startRecording = useCallback(async () => {
     if (isSpeaking) return; // Don't start if we're speaking
     
-    console.log('Starting recognition...');
-    if ('webkitSpeechRecognition' in window) {
-      try {
-        // Stop any existing recognition
-        if (recognitionRef.current) {
-          recognitionRef.current.stop();
+    try {
+      console.log('Starting recording...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        } 
+      });
+      
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+      
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        console.log('Data available:', event.data.size, 'bytes');
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
         }
+      };
 
-        const recognition = new (window as any).webkitSpeechRecognition();
-        recognitionRef.current = recognition;
+      mediaRecorder.onstop = async () => {
+        console.log('Recording stopped, processing audio...');
+        console.log('Audio chunks:', audioChunksRef.current.length);
+        console.log('Total audio size:', audioChunksRef.current.reduce((acc, chunk) => acc + chunk.size, 0), 'bytes');
         
-        recognition.continuous = false;
-        recognition.interimResults = true;
-        recognition.lang = recognitionLang;
-        console.log('Using recognition language:', recognitionLang);
-
-        recognition.onstart = () => {
-          console.log('Recognition started');
-          setIsListening(true);
-        };
-
-        recognition.onresult = async (event: any) => {
-          console.log('Recognition result received');
-          const transcript = event.results[0][0].transcript;
-          console.log('Transcript:', transcript);
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
+        console.log('Audio blob size:', audioBlob.size, 'bytes');
+        
+        // Save the recording for potential download
+        setLastRecording(audioBlob);
+        
+        try {
+          // Create a File object from the Blob
+          const audioFile = new File([audioBlob], 'audio.webm', { type: 'audio/webm;codecs=opus' });
+          console.log('Audio file size:', audioFile.size, 'bytes');
           
-          // Only process if we have a non-empty transcript
+          // Convert language code to ISO-639-1 format
+          const langCode = (import.meta.env.VITE_SPEECH_RECOGNITION_LANG || 'en').split('-')[0].toLowerCase();
+          console.log('Using language code:', langCode);
+          
+          // Transcribe audio using Whisper
+          const transcription = await openai.audio.transcriptions.create({
+            file: audioFile,
+            model: "whisper-1",
+            language: langCode,
+            response_format: "text"
+          });
+
+          // Since we're using response_format: "text", transcription is already a string
+          const transcript = transcription;
+          console.log('Raw transcription:', transcript);
+          
           if (transcript.trim()) {
             setTranscript(transcript);
-            stopListening();
 
             try {
               // Add user message to conversation history
@@ -128,52 +164,42 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
               setResponse('Sorry, I encountered an error.');
               speak('Sorry, I encountered an error.');
             }
+          } else {
+            console.log('Empty transcript received');
           }
-        };
+        } catch (error) {
+          console.error('Error transcribing audio:', error);
+          setResponse('Sorry, I had trouble understanding that.');
+          speak('Sorry, I had trouble understanding that.');
+        }
 
-        recognition.onerror = (event: any) => {
-          console.error('Speech recognition error:', event.error);
-          setIsListening(false);
-          if (timeoutRef.current) {
-            window.clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
-          }
-        };
+        // Stop all tracks in the stream
+        stream.getTracks().forEach(track => track.stop());
+      };
 
-        recognition.onend = () => {
-          console.log('Recognition ended');
-          setIsListening(false);
-          recognitionRef.current = null;
-          if (timeoutRef.current) {
-            window.clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
-          }
-        };
-
-        recognition.start();
-      } catch (error) {
-        console.error('Error setting up speech recognition:', error);
-        alert('Error setting up speech recognition. Please try again.');
-      }
-    } else {
-      alert('Speech recognition is not supported in this browser. Please try Chrome, Edge, or Safari.');
+      // Start recording with a specific timeslice to get data more frequently
+      mediaRecorder.start(100); // Get data every 100ms
+      setIsRecording(true);
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      alert('Error accessing microphone. Please make sure you have granted microphone permissions.');
     }
-  }, [speak, stopListening, conversationHistory, isSpeaking, recognitionLang]);
+  }, [speak, conversationHistory, isSpeaking]);
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    e.preventDefault(); // Prevent default behavior
-    startListening();
-  }, [startListening]);
+    e.preventDefault();
+    startRecording();
+  }, [startRecording]);
 
   const handlePointerUp = useCallback((e: React.PointerEvent) => {
-    e.preventDefault(); // Prevent default behavior
-    stopListening();
-  }, [stopListening]);
+    e.preventDefault();
+    stopRecording();
+  }, [stopRecording]);
 
   return (
     <div className="voice-chat-container">
       <div className="status">
-        {isListening ? 'Listening...' : isSpeaking ? 'Speaking...' : 'Ready'}
+        {isRecording ? 'Recording...' : isSpeaking ? 'Speaking...' : 'Ready'}
       </div>
       <button
         onPointerDown={handlePointerDown}
@@ -183,8 +209,17 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
         className="start-button"
         style={{ userSelect: 'none', WebkitUserSelect: 'none' }}
       >
-        {isListening ? 'Release to Stop' : isSpeaking ? 'Speaking...' : 'Press and Hold to Speak'}
+        {isRecording ? 'Release to Stop' : isSpeaking ? 'Speaking...' : 'Press and Hold to Speak'}
       </button>
+      {lastRecording && (
+        <button
+          onClick={downloadRecording}
+          className="download-button"
+          style={{ marginTop: '10px' }}
+        >
+          Download Last Recording
+        </button>
+      )}
       {transcript && (
         <div className="transcript">
           <h3>You said:</h3>
