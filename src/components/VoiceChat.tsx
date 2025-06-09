@@ -1,15 +1,26 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import OpenAI from 'openai';
 
 interface VoiceChatProps {
   apiKey: string;
 }
 
+type Message = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+
 const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [response, setResponse] = useState('');
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const recognitionRef = useRef<any>(null);
+  const [conversationHistory, setConversationHistory] = useState<Message[]>([]);
+  const timeoutRef = useRef<number | null>(null);
+
+  // Get the recognition language from environment variables, default to en-US
+  const recognitionLang = import.meta.env.VITE_SPEECH_RECOGNITION_LANG || 'en-US';
 
   const openai = new OpenAI({
     apiKey: apiKey,
@@ -47,51 +58,111 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
     }
   }, []);
 
-  const startListening = useCallback(() => {
-    if ('webkitSpeechRecognition' in window) {
-      const recognition = new (window as any).webkitSpeechRecognition();
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = 'en-US'; // Set language to English
-
-      recognition.onstart = () => {
-        setIsListening(true);
-      };
-
-      recognition.onresult = async (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setTranscript(transcript);
-
-        try {
-          const completion = await openai.chat.completions.create({
-            messages: [{ role: "user", content: transcript }],
-            model: "gpt-3.5-turbo",
-          });
-
-          const aiResponse = completion.choices[0].message.content;
-          setResponse(aiResponse || '');
-          speak(aiResponse || '');
-        } catch (error) {
-          console.error('Error:', error);
-          setResponse('Sorry, I encountered an error.');
-          speak('Sorry, I encountered an error.');
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        console.error('Speech recognition error:', event.error);
-        setIsListening(false);
-      };
-
-      recognition.onend = () => {
-        setIsListening(false);
-      };
-
-      recognition.start();
-    } else {
-      alert('Speech recognition is not supported in this browser.');
+  const stopListening = useCallback(() => {
+    if (recognitionRef.current) {
+      console.log('Stopping recognition...');
+      recognitionRef.current.stop();
+      setIsListening(false);
+      if (timeoutRef.current) {
+        window.clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
     }
-  }, [speak]);
+  }, []);
+
+  const startListening = useCallback(() => {
+    console.log('Starting recognition...');
+    if ('webkitSpeechRecognition' in window) {
+      try {
+        // Stop any existing recognition
+        if (recognitionRef.current) {
+          recognitionRef.current.stop();
+        }
+
+        const recognition = new (window as any).webkitSpeechRecognition();
+        recognitionRef.current = recognition;
+        
+        recognition.continuous = false;
+        recognition.interimResults = true;
+        recognition.lang = recognitionLang;
+        console.log('Using recognition language:', recognitionLang);
+
+        recognition.onstart = () => {
+          console.log('Recognition started');
+          setIsListening(true);
+          // Set a minimum listening time of 2 seconds
+          timeoutRef.current = window.setTimeout(() => {
+            if (isListening) {
+              stopListening();
+            }
+          }, 2000);
+        };
+
+        recognition.onresult = async (event: any) => {
+          console.log('Recognition result received');
+          const transcript = event.results[0][0].transcript;
+          console.log('Transcript:', transcript);
+          
+          // Only process if we have a non-empty transcript
+          if (transcript.trim()) {
+            setTranscript(transcript);
+            stopListening();
+
+            try {
+              // Add user message to conversation history
+              const updatedHistory = [...conversationHistory, { role: "user" as const, content: transcript }];
+              setConversationHistory(updatedHistory);
+
+              console.log('Sending to OpenAI...');
+              const completion = await openai.chat.completions.create({
+                messages: updatedHistory,
+                model: "gpt-3.5-turbo",
+              });
+
+              const aiResponse = completion.choices[0].message.content;
+              console.log('OpenAI response:', aiResponse);
+              setResponse(aiResponse || '');
+              
+              // Add assistant response to conversation history
+              setConversationHistory(prev => [...prev, { role: "assistant" as const, content: aiResponse || '' }]);
+              
+              speak(aiResponse || '');
+            } catch (error) {
+              console.error('OpenAI API error:', error);
+              setResponse('Sorry, I encountered an error.');
+              speak('Sorry, I encountered an error.');
+            }
+          }
+        };
+
+        recognition.onerror = (event: any) => {
+          console.error('Speech recognition error:', event.error);
+          setIsListening(false);
+          if (timeoutRef.current) {
+            window.clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+          }
+        };
+
+        recognition.onend = () => {
+          console.log('Recognition ended');
+          setIsListening(false);
+          recognitionRef.current = null;
+          if (timeoutRef.current) {
+            window.clearTimeout(timeoutRef.current);
+            timeoutRef.current = null;
+          }
+        };
+
+        recognition.start();
+      } catch (error) {
+        console.error('Error setting up speech recognition:', error);
+        alert('Error setting up speech recognition. Please try again.');
+      }
+    } else {
+      alert('Speech recognition is not supported in this browser. Please try Chrome, Edge, or Safari.');
+    }
+  }, [speak, stopListening, conversationHistory, isListening, recognitionLang]);
 
   return (
     <div className="voice-chat-container">
@@ -99,11 +170,11 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
         {isListening ? 'Listening...' : isSpeaking ? 'Speaking...' : 'Ready'}
       </div>
       <button
-        onClick={startListening}
-        disabled={isListening || isSpeaking}
+        onClick={isListening ? stopListening : startListening}
+        disabled={isSpeaking}
         className="start-button"
       >
-        {isListening ? 'Listening...' : isSpeaking ? 'Speaking...' : 'Start Speaking'}
+        {isListening ? 'Stop Listening' : isSpeaking ? 'Speaking...' : 'Start Speaking'}
       </button>
       {transcript && (
         <div className="transcript">
