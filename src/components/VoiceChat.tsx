@@ -71,6 +71,8 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
   }, []);
 
   const startListening = useCallback(() => {
+    if (isSpeaking) return; // Don't start if we're speaking
+    
     console.log('Starting recognition...');
     if ('webkitSpeechRecognition' in window) {
       try {
@@ -90,12 +92,6 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
         recognition.onstart = () => {
           console.log('Recognition started');
           setIsListening(true);
-          // Set a minimum listening time of 2 seconds
-          timeoutRef.current = window.setTimeout(() => {
-            if (isListening) {
-              stopListening();
-            }
-          }, 2000);
         };
 
         recognition.onresult = async (event: any) => {
@@ -162,7 +158,17 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
     } else {
       alert('Speech recognition is not supported in this browser. Please try Chrome, Edge, or Safari.');
     }
-  }, [speak, stopListening, conversationHistory, isListening, recognitionLang]);
+  }, [speak, stopListening, conversationHistory, isSpeaking, recognitionLang]);
+
+  const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    e.preventDefault(); // Prevent default behavior
+    startListening();
+  }, [startListening]);
+
+  const handlePointerUp = useCallback((e: React.PointerEvent) => {
+    e.preventDefault(); // Prevent default behavior
+    stopListening();
+  }, [stopListening]);
 
   return (
     <div className="voice-chat-container">
@@ -170,11 +176,14 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
         {isListening ? 'Listening...' : isSpeaking ? 'Speaking...' : 'Ready'}
       </div>
       <button
-        onClick={isListening ? stopListening : startListening}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerUp}
         disabled={isSpeaking}
         className="start-button"
+        style={{ userSelect: 'none', WebkitUserSelect: 'none' }}
       >
-        {isListening ? 'Stop Listening' : isSpeaking ? 'Speaking...' : 'Start Speaking'}
+        {isListening ? 'Release to Stop' : isSpeaking ? 'Speaking...' : 'Press and Hold to Speak'}
       </button>
       {transcript && (
         <div className="transcript">
