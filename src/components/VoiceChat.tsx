@@ -121,51 +121,75 @@ const VoiceChat: React.FC<VoiceChatProps> = ({ apiKey }) => {
           const audioFile = new File([audioBlob], 'audio.webm', { type: 'audio/webm;codecs=opus' });
           console.log('Audio file size:', audioFile.size, 'bytes');
           
-          // Convert language code to ISO-639-1 format
-          const langCode = (import.meta.env.VITE_SPEECH_RECOGNITION_LANG || 'en').split('-')[0].toLowerCase();
-          console.log('Using language code:', langCode);
-          
-          // Transcribe audio using Whisper
-          const transcription = await openai.audio.transcriptions.create({
-            file: audioFile,
-            model: "whisper-1",
-            language: langCode,
-            response_format: "text"
-          });
+          try {
+            // Convert audio blob to base64
+            const reader = new FileReader();
+            const base64Audio = await new Promise<string>((resolve, reject) => {
+              reader.onload = () => {
+                // Keep the full data URL including the MIME type prefix
+                const base64 = reader.result as string;
+                resolve(base64);
+              };
+              reader.onerror = reject;
+              reader.readAsDataURL(audioFile);
+            });
 
-          // Since we're using response_format: "text", transcription is already a string
-          const transcript = transcription;
-          console.log('Raw transcription:', transcript);
-          
-          if (transcript.trim()) {
-            setTranscript(transcript);
+            // Send audio to transcription endpoint
+            const response = await fetch('https://automation.leanscope.ai/webhook-test/transcribe-audio', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                data: base64Audio // This will now include the full data URL with MIME type
+              })
+            });
 
-            try {
-              // Add user message to conversation history
-              const updatedHistory = [...conversationHistory, { role: "user" as const, content: transcript }];
-              setConversationHistory(updatedHistory);
-
-              console.log('Sending to OpenAI...');
-              const completion = await openai.chat.completions.create({
-                messages: updatedHistory,
-                model: "gpt-3.5-turbo",
-              });
-
-              const aiResponse = completion.choices[0].message.content;
-              console.log('OpenAI response:', aiResponse);
-              setResponse(aiResponse || '');
-              
-              // Add assistant response to conversation history
-              setConversationHistory(prev => [...prev, { role: "assistant" as const, content: aiResponse || '' }]);
-              
-              speak(aiResponse || '');
-            } catch (error) {
-              console.error('OpenAI API error:', error);
-              setResponse('Sorry, I encountered an error.');
-              speak('Sorry, I encountered an error.');
+            if (!response.ok) {
+              throw new Error(`HTTP error! status: ${response.status}`);
             }
-          } else {
-            console.log('Empty transcript received');
+
+            const result = await response.json();
+            const transcript = result.speechInputText || '';
+            console.log('Raw transcription:', transcript);
+            
+            if (transcript.trim()) {
+              setTranscript(transcript);
+
+              try {
+                // Add user message to conversation history
+                const updatedHistory = [...conversationHistory, { role: "user" as const, content: transcript }];
+                setConversationHistory(updatedHistory);
+
+                // Get response using the Responses API
+                const response = await openai.responses.create({
+                  model: "gpt-4.1",
+                  input: updatedHistory.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                  }))
+                });
+
+                const aiResponse = response.output_text;
+                console.log('OpenAI response:', aiResponse);
+                setResponse(aiResponse);
+                
+                // Add assistant response to conversation history
+                setConversationHistory(prev => [...prev, { role: "assistant" as const, content: aiResponse }]);
+                
+                speak(aiResponse);
+              } catch (error) {
+                console.error('OpenAI API error:', error);
+                setResponse('Sorry, I encountered an error.');
+                speak('Sorry, I encountered an error.');
+              }
+            } else {
+              console.log('Empty transcript received');
+            }
+          } catch (error) {
+            console.error('Error transcribing audio:', error);
+            setResponse('Sorry, I had trouble understanding that.');
+            speak('Sorry, I had trouble understanding that.');
           }
         } catch (error) {
           console.error('Error transcribing audio:', error);
